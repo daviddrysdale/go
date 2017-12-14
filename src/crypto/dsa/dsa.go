@@ -194,9 +194,36 @@ func fermatInverse(k, P *big.Int) *big.Int {
 //
 // Be aware that calling Sign with an attacker-controlled PrivateKey may
 // require an arbitrary amount of CPU.
-func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (r, s *big.Int, err error) {
-	// FIPS 186-3, section 4.6
+func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (*big.Int, *big.Int, error) {
+	picker := func() (*big.Int, error) { return randElementPicker(rand, priv.Q) }
+	return innerSign(picker, priv, hash)
+}
 
+type fieldPicker func() (*big.Int, error)
+
+// randElementPicker chooses a random field element.
+func randElementPicker(rand io.Reader, q *big.Int) (*big.Int, error) {
+	n := q.BitLen() >> 3
+	k := new(big.Int)
+	buf := make([]byte, n)
+	for {
+		if _, err := io.ReadFull(rand, buf); err != nil {
+			return nil, err
+		}
+		k.SetBytes(buf)
+		// q must be >= 128 because the test in Sign
+		// requires it to be > 0 and that
+		//    ceil(log_2(Q)) mod 8 = 0
+		// Thus this loop will quickly terminate.
+		if k.Sign() > 0 && k.Cmp(q) < 0 {
+			break
+		}
+	}
+	return k, nil
+}
+
+func innerSign(picker fieldPicker, priv *PrivateKey, hash []byte) (r, s *big.Int, err error) {
+	// FIPS 186-3, section 4.6
 	n := priv.Q.BitLen()
 	if priv.Q.Sign() <= 0 || priv.P.Sign() <= 0 || priv.G.Sign() <= 0 || priv.X.Sign() <= 0 || n&7 != 0 {
 		err = ErrInvalidPublicKey
@@ -206,21 +233,9 @@ func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (r, s *big.Int, err err
 
 	var attempts int
 	for attempts = 10; attempts > 0; attempts-- {
-		k := new(big.Int)
-		buf := make([]byte, n)
-		for {
-			_, err = io.ReadFull(rand, buf)
-			if err != nil {
-				return
-			}
-			k.SetBytes(buf)
-			// priv.Q must be >= 128 because the test above
-			// requires it to be > 0 and that
-			//    ceil(log_2(Q)) mod 8 = 0
-			// Thus this loop will quickly terminate.
-			if k.Sign() > 0 && k.Cmp(priv.Q) < 0 {
-				break
-			}
+		k, err := picker()
+		if err != nil {
+			return nil, nil, err
 		}
 
 		kInv := fermatInverse(k, priv.Q)
