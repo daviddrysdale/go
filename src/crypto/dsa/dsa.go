@@ -8,6 +8,8 @@
 package dsa
 
 import (
+	"crypto"
+	"crypto/rfc6979"
 	"errors"
 	"io"
 	"math/big"
@@ -30,6 +32,10 @@ type PrivateKey struct {
 	PublicKey
 	X *big.Int
 }
+
+// DeterministicPrivateKey represents a DSA private key that
+// generates deterministic signatures according to RFC 6979.
+type DeterministicPrivateKey PrivateKey
 
 // ErrInvalidPublicKey results when a public key is not usable by this code.
 // FIPS is quite strict about the format of DSA keys, but other code may be
@@ -173,6 +179,12 @@ func GenerateKey(priv *PrivateKey, rand io.Reader) error {
 	return nil
 }
 
+// GenerateDeterministicKey generates a public&private key pair. The Parameters of the
+// PrivateKey must already be valid (see GenerateParameters).
+func GenerateDeterministicKey(priv *DeterministicPrivateKey, rand io.Reader) error {
+	return GenerateKey((*PrivateKey)(priv), rand)
+}
+
 // fermatInverse calculates the inverse of k in GF(P) using Fermat's method.
 // This has better constant-time properties than Euclid's method (implemented
 // in math/big.Int.ModInverse) although math/big itself isn't strictly
@@ -197,6 +209,30 @@ func fermatInverse(k, P *big.Int) *big.Int {
 func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (*big.Int, *big.Int, error) {
 	picker := func() (*big.Int, error) { return randElementPicker(rand, priv.Q) }
 	return innerSign(picker, priv, hash)
+}
+
+// DeterministicSign signs an arbitrary length hash (which should be the result
+// of hashing a larger message) using the private key, priv, using a
+// deterministic signature mechanism from RFC6979. It returns the signature as a
+// pair of integers. The security of the private key depends on the entropy of
+// rand.
+//
+// Note that FIPS 186-3 section 4.6 specifies that the hash should be truncated
+// to the byte-length of the subgroup. This function does not perform that
+// truncation itself.
+//
+// Be aware that calling Sign with an attacker-controlled PrivateKey may
+// require an arbitrary amount of CPU.
+func DeterministicSign(priv *DeterministicPrivateKey, hash []byte, opts crypto.SignerOpts) (*big.Int, *big.Int, error) {
+	if opts == nil || opts.HashFunc() == 0 {
+		return nil, nil, errors.New("no hash function provided")
+	}
+	g, err := rfc6979.NewGenerator(priv.Q, priv.X, hash, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	picker := func() (*big.Int, error) { return g.Generate() }
+	return innerSign(picker, (*PrivateKey)(priv), hash)
 }
 
 type fieldPicker func() (*big.Int, error)
