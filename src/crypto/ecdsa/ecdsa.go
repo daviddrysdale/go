@@ -21,6 +21,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/elliptic"
+	"crypto/rfc6979"
 	"crypto/sha512"
 	"encoding/asn1"
 	"errors"
@@ -56,12 +57,21 @@ type PrivateKey struct {
 	D *big.Int
 }
 
+// DeterministicPrivateKey represents a ECDSA private key that
+// generates deterministic signatures according to RFC 6979.
+type DeterministicPrivateKey PrivateKey
+
 type ecdsaSignature struct {
 	R, S *big.Int
 }
 
 // Public returns the public key corresponding to priv.
 func (priv *PrivateKey) Public() crypto.PublicKey {
+	return &priv.PublicKey
+}
+
+// Public returns the public key corresponding to priv.
+func (priv *DeterministicPrivateKey) Public() crypto.PublicKey {
 	return &priv.PublicKey
 }
 
@@ -75,6 +85,18 @@ func (priv *PrivateKey) Sign(rand io.Reader, msg []byte, opts crypto.SignerOpts)
 		return nil, err
 	}
 
+	return asn1.Marshal(ecdsaSignature{r, s})
+}
+
+// Sign signs msg with priv, deterministically. This method is
+// intended to support keys where the private part is kept in, for example, a
+// hardware module. Common uses should use the Sign function in this package
+// directly.
+func (priv *DeterministicPrivateKey) Sign(_ io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+	r, s, err := DeterministicSign(priv, msg, opts)
+	if err != nil {
+		return nil, err
+	}
 	return asn1.Marshal(ecdsaSignature{r, s})
 }
 
@@ -109,6 +131,12 @@ func GenerateKey(c elliptic.Curve, rand io.Reader) (*PrivateKey, error) {
 	priv.D = k
 	priv.PublicKey.X, priv.PublicKey.Y = c.ScalarBaseMult(k.Bytes())
 	return priv, nil
+}
+
+// GenerateDeterministicKey generates a public and private key pair.
+func GenerateDeterministicKey(c elliptic.Curve, rand io.Reader) (*DeterministicPrivateKey, error) {
+	key, err := GenerateKey(c, rand)
+	return (*DeterministicPrivateKey)(key), err
 }
 
 // hashToInt converts a hash value to an integer. There is some disagreement
@@ -158,6 +186,22 @@ func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (r, s *big.Int, err err
 		return nil, nil, err
 	}
 	return innerSign(picker, priv, hash)
+}
+
+// DeterministicSign signs a hash (which should be the result of hashing a
+// larger message) using the private key, priv. If the hash is longer than the
+// bit-length of the private key's curve order, the hash will be truncated to
+// that length.  It returns the signature as a pair of integers.
+func DeterministicSign(priv *DeterministicPrivateKey, hash []byte, opts crypto.SignerOpts) (r, s *big.Int, err error) {
+	if opts == nil || opts.HashFunc() == 0 {
+		return nil, nil, errors.New("no hash function provided")
+	}
+	g, err := rfc6979.NewGenerator(priv.Params().N, priv.D, hash, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	picker := func() (*big.Int, error) { return g.Generate() }
+	return innerSign(picker, (*PrivateKey)(priv), hash)
 }
 
 type fieldPicker func() (*big.Int, error)
