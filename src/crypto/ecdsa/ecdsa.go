@@ -24,6 +24,7 @@ import (
 	"crypto/sha512"
 	"encoding/asn1"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 )
@@ -149,15 +150,28 @@ var errZeroParam = errors.New("zero parameter")
 // returns the signature as a pair of integers. The security of the private key
 // depends on the entropy of rand.
 func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (r, s *big.Int, err error) {
+	if rand == nil {
+		return nil, nil, fmt.Errorf("no randomness source provided")
+	}
+	picker, err := randElementPicker(rand, priv, hash)
+	if err != nil {
+		return nil, nil, err
+	}
+	return innerSign(picker, priv, hash)
+}
+
+type fieldPicker func() (*big.Int, error)
+
+func randElementPicker(rand io.Reader, priv *PrivateKey, hash []byte) (fieldPicker, error) {
 	// Get min(log2(q) / 2, 256) bits of entropy from rand.
 	entropylen := (priv.Curve.Params().BitSize + 7) / 16
 	if entropylen > 32 {
 		entropylen = 32
 	}
 	entropy := make([]byte, entropylen)
-	_, err = io.ReadFull(rand, entropy)
+	_, err := io.ReadFull(rand, entropy)
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	// Initialize an SHA-512 hash context; digest ...
@@ -171,7 +185,7 @@ func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (r, s *big.Int, err err
 	// Create an AES-CTR instance to use as a CSPRNG.
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// Create a CSPRNG that xors a stream of zeros with
@@ -180,7 +194,13 @@ func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (r, s *big.Int, err err
 		R: zeroReader,
 		S: cipher.NewCTR(block, []byte(aesIV)),
 	}
+	c := priv.PublicKey.Curve
+	return func() (*big.Int, error) {
+		return randFieldElement(c, csprng)
+	}, nil
+}
 
+func innerSign(picker fieldPicker, priv *PrivateKey, hash []byte) (r, s *big.Int, err error) {
 	// See [NSA] 3.4.1
 	c := priv.PublicKey.Curve
 	N := c.Params().N
@@ -190,7 +210,7 @@ func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (r, s *big.Int, err err
 	var k, kInv *big.Int
 	for {
 		for {
-			k, err = randFieldElement(c, csprng)
+			k, err = picker()
 			if err != nil {
 				r = nil
 				return
