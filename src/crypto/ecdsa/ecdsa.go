@@ -21,9 +21,11 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/elliptic"
+	"crypto/rfc6979"
 	"crypto/sha512"
 	"encoding/asn1"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 )
@@ -55,12 +57,21 @@ type PrivateKey struct {
 	D *big.Int
 }
 
+// DeterministicPrivateKey represents a ECDSA private key that
+// generates deterministic signatures according to RFC 6979.
+type DeterministicPrivateKey PrivateKey
+
 type ecdsaSignature struct {
 	R, S *big.Int
 }
 
 // Public returns the public key corresponding to priv.
 func (priv *PrivateKey) Public() crypto.PublicKey {
+	return &priv.PublicKey
+}
+
+// Public returns the public key corresponding to priv.
+func (priv *DeterministicPrivateKey) Public() crypto.PublicKey {
 	return &priv.PublicKey
 }
 
@@ -74,6 +85,18 @@ func (priv *PrivateKey) Sign(rand io.Reader, msg []byte, opts crypto.SignerOpts)
 		return nil, err
 	}
 
+	return asn1.Marshal(ecdsaSignature{r, s})
+}
+
+// Sign signs msg with priv, deterministically. This method is
+// intended to support keys where the private part is kept in, for example, a
+// hardware module. Common uses should use the Sign function in this package
+// directly.
+func (priv *DeterministicPrivateKey) Sign(_ io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+	r, s, err := DeterministicSign(priv, msg, opts)
+	if err != nil {
+		return nil, err
+	}
 	return asn1.Marshal(ecdsaSignature{r, s})
 }
 
@@ -108,6 +131,12 @@ func GenerateKey(c elliptic.Curve, rand io.Reader) (*PrivateKey, error) {
 	priv.D = k
 	priv.PublicKey.X, priv.PublicKey.Y = c.ScalarBaseMult(k.Bytes())
 	return priv, nil
+}
+
+// GenerateDeterministicKey generates a public and private key pair.
+func GenerateDeterministicKey(c elliptic.Curve, rand io.Reader) (*DeterministicPrivateKey, error) {
+	key, err := GenerateKey(c, rand)
+	return (*DeterministicPrivateKey)(key), err
 }
 
 // hashToInt converts a hash value to an integer. There is some disagreement
@@ -149,15 +178,44 @@ var errZeroParam = errors.New("zero parameter")
 // returns the signature as a pair of integers. The security of the private key
 // depends on the entropy of rand.
 func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (r, s *big.Int, err error) {
+	if rand == nil {
+		return nil, nil, fmt.Errorf("no randomness source provided")
+	}
+	picker, err := randElementPicker(rand, priv, hash)
+	if err != nil {
+		return nil, nil, err
+	}
+	return innerSign(picker, priv, hash)
+}
+
+// DeterministicSign signs a hash (which should be the result of hashing a
+// larger message) using the private key, priv. If the hash is longer than the
+// bit-length of the private key's curve order, the hash will be truncated to
+// that length.  It returns the signature as a pair of integers.
+func DeterministicSign(priv *DeterministicPrivateKey, hash []byte, opts crypto.SignerOpts) (r, s *big.Int, err error) {
+	if opts == nil || opts.HashFunc() == 0 {
+		return nil, nil, errors.New("no hash function provided")
+	}
+	g, err := rfc6979.NewGenerator(priv.Params().N, priv.D, hash, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	picker := func() (*big.Int, error) { return g.Generate() }
+	return innerSign(picker, (*PrivateKey)(priv), hash)
+}
+
+type fieldPicker func() (*big.Int, error)
+
+func randElementPicker(rand io.Reader, priv *PrivateKey, hash []byte) (fieldPicker, error) {
 	// Get min(log2(q) / 2, 256) bits of entropy from rand.
 	entropylen := (priv.Curve.Params().BitSize + 7) / 16
 	if entropylen > 32 {
 		entropylen = 32
 	}
 	entropy := make([]byte, entropylen)
-	_, err = io.ReadFull(rand, entropy)
+	_, err := io.ReadFull(rand, entropy)
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	// Initialize an SHA-512 hash context; digest ...
@@ -171,7 +229,7 @@ func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (r, s *big.Int, err err
 	// Create an AES-CTR instance to use as a CSPRNG.
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// Create a CSPRNG that xors a stream of zeros with
@@ -180,7 +238,13 @@ func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (r, s *big.Int, err err
 		R: zeroReader,
 		S: cipher.NewCTR(block, []byte(aesIV)),
 	}
+	c := priv.PublicKey.Curve
+	return func() (*big.Int, error) {
+		return randFieldElement(c, csprng)
+	}, nil
+}
 
+func innerSign(picker fieldPicker, priv *PrivateKey, hash []byte) (r, s *big.Int, err error) {
 	// See [NSA] 3.4.1
 	c := priv.PublicKey.Curve
 	N := c.Params().N
@@ -190,7 +254,7 @@ func Sign(rand io.Reader, priv *PrivateKey, hash []byte) (r, s *big.Int, err err
 	var k, kInv *big.Int
 	for {
 		for {
-			k, err = randFieldElement(c, csprng)
+			k, err = picker()
 			if err != nil {
 				r = nil
 				return
